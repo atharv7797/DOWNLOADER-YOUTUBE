@@ -117,13 +117,27 @@ def schedule_file_deletion(path: str, delay: int = FILE_TTL_SECONDS):
 
 def base_ydl_opts():
     """
-    Common yt-dlp options.
+    Common yt-dlp options for YouTube.
     """
 
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+
+        "extractor_args": {
+            "youtube": {
+                "player_client": [
+                    "default",
+                    "web_embedded",
+                    "tv",
+                    "android"
+                ]
+            }
+        },
+
+        "retries": 3,
+        "fragment_retries": 3,
     }
 
     cookie_file = get_cookie_file()
