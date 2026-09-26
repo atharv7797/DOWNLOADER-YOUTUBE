@@ -115,37 +115,24 @@ def schedule_file_deletion(path: str, delay: int = FILE_TTL_SECONDS):
     threading.Thread(target=_delete, daemon=True).start()
 
 
-def base_ydl_opts():
-    """
-    Common yt-dlp options for YouTube.
-    """
-
-    opts = {
+def _base_ydl_opts() -> dict:
+    return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-
+        "cookiefile": "cookies.txt",  # Ensure cookies.txt exists in the working dir
+        "js_runtimes": {
+            "node": {}
+        },
         "extractor_args": {
             "youtube": {
-                "player_client": [
-                    "default",
-                    "web_embedded",
-                    "tv",
-                    "android"
-                ]
+                "player_client": ["ios", "android", "mweb", "web"]
+            },
+            "youtubepot-bgutilhttp": {
+                "base_url": ["http://127.0.0.1:4416"]  # Must match the node server port in Dockerfile
             }
         },
-
-        "retries": 3,
-        "fragment_retries": 3,
     }
-
-    cookie_file = get_cookie_file()
-
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
-
-    return opts
 
 
 def build_format_list(info):
