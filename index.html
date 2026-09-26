@@ -378,7 +378,7 @@ async function handleFetchInfo() {
 
     renderResult(url, data);
   } catch (err) {
-    showError('Could not reach the backend. Is it running on localhost:5000?');
+    showError('Could not reach the backend.');
   } finally {
     fetchBtn.disabled = false;
     fetchBtn.textContent = 'Get video';
