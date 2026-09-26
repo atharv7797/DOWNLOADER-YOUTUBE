@@ -52,12 +52,26 @@ LOCAL_COOKIE_FILE = os.path.join(
 
 def get_cookie_file():
     """
-    Use Render Secret File when deployed.
+    Use Render Secret File, but copy it to /tmp because
+    /etc/secrets is read-only.
+
     Fall back to local cookies.txt during local development.
     """
-
     if os.path.isfile(RENDER_COOKIE_FILE):
-        return RENDER_COOKIE_FILE
+        writable_cookie_file = os.path.join(
+            DOWNLOAD_DIR,
+            "cookies.txt"
+        )
+
+        try:
+            with open(RENDER_COOKIE_FILE, "rb") as source:
+                with open(writable_cookie_file, "wb") as destination:
+                    destination.write(source.read())
+
+            return writable_cookie_file
+
+        except OSError:
+            return None
 
     if os.path.isfile(LOCAL_COOKIE_FILE):
         return LOCAL_COOKIE_FILE
