@@ -145,7 +145,7 @@ def base_ydl_opts():
     if cookie_file:
         opts["cookiefile"] = cookie_file
 
-    return opts
+    return optsss
 
 
 def build_format_list(info):
