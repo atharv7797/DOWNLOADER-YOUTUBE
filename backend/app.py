@@ -1,50 +1,82 @@
 """
-YouTube Video Downloader - Backend API
----------------------------------------
-Built with Flask + yt-dlp.
+YouTube Video Downloader - Flask Backend
 
 Endpoints:
-  GET  /api/health                -> simple health check
-  POST /api/info                  -> get video metadata + available formats
-  POST /api/download              -> download a video (by format_id) and return the file
+    GET  /api/health
+    GET  /api/info?url=<youtube-url>
+    GET  /api/download?url=<youtube-url>&height=<resolution>
 
-Run:
-  pip install -r requirements.txt
-  python app.py
-  # server starts on http://localhost:5000
+Also accepts POST requests for /api/info and /api/download.
 """
 
 import glob
 import os
 import re
-import uuid
 import threading
 import time
+import uuid
 
 from flask import Flask, request, jsonify, send_file, after_this_request
 from flask_cors import CORS
 import yt_dlp
 
-app = Flask(__name__)
-CORS(app)  # allow requests from any frontend (e.g. React dev server)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+app = Flask(__name__)
+CORS(app)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DOWNLOAD_DIR = "/tmp/fetch-downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# how long (seconds) to keep a downloaded file on disk before auto-deleting it
-FILE_TTL_SECONDS = 60 * 30  # 30 minutes
+FILE_TTL_SECONDS = 30 * 60
+
+ALLOWED_HEIGHTS = [1080, 720, 480, 360, 240, 144]
+
+# Render Secret File location.
+# If running locally, it can fall back to backend/cookies.txt.
+RENDER_COOKIE_FILE = "/etc/secrets/cookies.txt"
+
+LOCAL_COOKIE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "cookies.txt"
+)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_cookie_file():
+    """
+    Use Render Secret File when deployed.
+    Fall back to local cookies.txt during local development.
+    """
+
+    if os.path.isfile(RENDER_COOKIE_FILE):
+        return RENDER_COOKIE_FILE
+
+    if os.path.isfile(LOCAL_COOKIE_FILE):
+        return LOCAL_COOKIE_FILE
+
+    return None
+
+
 def is_valid_youtube_url(url: str) -> bool:
+    if not url:
+        return False
+
     pattern = re.compile(
-        r"^(https?://)?(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)/.+$"
+        r"^(https?://)?"
+        r"(www\.)?"
+        r"(youtube\.com|youtu\.be|m\.youtube\.com)"
+        r"/.+$",
+        re.IGNORECASE
     )
+
     return bool(pattern.match(url.strip()))
 
 
@@ -53,10 +85,13 @@ def sanitize_filename(name: str) -> str:
 
 
 def schedule_file_deletion(path: str, delay: int = FILE_TTL_SECONDS):
-    """Delete a file after `delay` seconds, in a background thread."""
+    """
+    Delete downloaded file after a delay.
+    """
 
     def _delete():
         time.sleep(delay)
+
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -66,207 +101,398 @@ def schedule_file_deletion(path: str, delay: int = FILE_TTL_SECONDS):
     threading.Thread(target=_delete, daemon=True).start()
 
 
-# Only ever offer these resolutions, capped at 1080p, so the frontend
-# shows a clean, fixed set of choices instead of yt-dlp's full raw dump.
-ALLOWED_HEIGHTS = [1080, 720, 480, 360, 240, 144]
-
-
-def build_format_list(info: dict):
+def base_ydl_opts():
     """
-    Build one selectable video format for each target resolution.
-    Accepts any video format up to 1080p instead of requiring an
-    exact height match.
+    Common yt-dlp options.
     """
 
-    target_heights = [1080, 720, 480, 360, 240, 144]
-    formats = []
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    cookie_file = get_cookie_file()
+
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+
+    return opts
+
+
+def build_format_list(info):
+    """
+    Convert yt-dlp's raw formats into the simple quality format
+    expected by the current frontend.
+    """
 
     raw_formats = info.get("formats", [])
 
-    # Keep video formats only
-    video_formats = []
+    results = []
 
-    for f in raw_formats:
-        vcodec = f.get("vcodec")
+    for target_height in ALLOWED_HEIGHTS:
 
-        if not vcodec or vcodec == "none":
-            continue
+        candidates = []
 
-        height = f.get("height")
+        for fmt in raw_formats:
 
-        if not height:
-            continue
+            height = fmt.get("height")
+            vcodec = fmt.get("vcodec")
 
-        # Never allow anything above 1080p
-        if height > 1080:
-            continue
+            if not height:
+                continue
 
-        video_formats.append(f)
+            if height > target_height:
+                continue
 
-    # Pick the closest available format for each target resolution
-    for target in target_heights:
+            if height > 1080:
+                continue
 
-        candidates = [
-            f for f in video_formats
-            if f.get("height") <= target
-        ]
+            if not vcodec or vcodec == "none":
+                continue
+
+            candidates.append(fmt)
 
         if not candidates:
             continue
 
-        # Prefer the highest resolution <= target.
-        # If equal, prefer mp4 and higher FPS.
+        def format_score(fmt):
+            height = fmt.get("height") or 0
+            fps = fmt.get("fps") or 0
+            ext = fmt.get("ext") or ""
+
+            # Prefer MP4 where possible.
+            mp4_bonus = 1 if ext == "mp4" else 0
+
+            # Prefer higher resolution/fps.
+            return (
+                height,
+                mp4_bonus,
+                fps
+            )
+
         candidates.sort(
-            key=lambda f: (
-                f.get("height") or 0,
-                1 if f.get("ext") == "mp4" else 0,
-                f.get("fps") or 0
-            ),
+            key=format_score,
             reverse=True
         )
 
         best = candidates[0]
 
-        # Don't show duplicate resolutions
-        if any(x["format_id"] == best.get("format_id") for x in formats):
+        actual_height = best.get("height")
+
+        # Avoid duplicate displayed resolutions.
+        if any(
+            item["height"] == actual_height
+            for item in results
+        ):
             continue
 
-        formats.append({
-            "format_id": best.get("format_id"),
-            "ext": "mp4",
-            "resolution": f"{best.get('height')}p",
-            "fps": best.get("fps"),
-            "filesize_approx": (
-                best.get("filesize")
-                or best.get("filesize_approx")
-            ),
-            "type": "video+audio"
+        filesize = (
+            best.get("filesize")
+            or best.get("filesize_approx")
+        )
+
+        approx_mb = None
+
+        if filesize:
+            approx_mb = round(filesize / 1024 / 1024)
+
+        results.append({
+            "label": f"{actual_height}p",
+            "height": actual_height,
+            "approx_mb": approx_mb,
+            "badge": (
+                "recommended"
+                if actual_height == max(
+                    [x.get("height") for x in candidates]
+                )
+                else ""
+            )
         })
 
-    return formats
+    # Highest quality first.
+    results.sort(
+        key=lambda x: x["height"],
+        reverse=True
+    )
+
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+def extract_request_data():
+    """
+    Accept both:
+
+        GET:
+        ?url=...
+
+    and:
+
+        POST:
+        {"url": "..."}
+    """
+
+    if request.method == "GET":
+        data = request.args.to_dict()
+
+    else:
+        data = request.get_json(silent=True) or {}
+
+    return data
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+
+    cookie_file = get_cookie_file()
+
+    return jsonify({
+        "status": "ok",
+        "cookies": bool(cookie_file),
+        "ffmpeg": bool(
+            __import__("shutil").which("ffmpeg")
+        )
+    })
 
 
-@app.route("/api/info", methods=["POST"])
+# ============================================================
+# VIDEO INFO
+# ============================================================
+
+@app.route("/api/info", methods=["GET", "POST"])
 def get_info():
-    """
-    Request JSON:  { "url": "<youtube url>" }
-    Response JSON: { title, thumbnail, duration, uploader, formats: [...] }
-    """
-    data = request.get_json(silent=True) or {}
-    url = data.get("url", "").strip()
+
+    data = extract_request_data()
+
+    url = str(
+        data.get("url", "")
+    ).strip()
 
     if not url:
-        return jsonify({"error": "Missing 'url' in request body"}), 400
-    if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+        return jsonify({
+            "detail": "Missing 'url'."
+        }), 400
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "extractor_args": {"youtube": ["player_client=web,mweb"]},
-    }
+    if not is_valid_youtube_url(url):
+        return jsonify({
+            "detail": "Invalid YouTube URL."
+        }), 400
+
+    ydl_opts = base_ydl_opts()
 
     try:
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": f"Could not fetch video info: {str(e)}"}), 422
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
+
+    except yt_dlp.utils.DownloadError as exc:
+
+        return jsonify({
+            "detail": f"Couldn't read that video: {str(exc)}"
+        }), 422
+
+    except Exception as exc:
+
+        return jsonify({
+            "detail": f"Unexpected error: {str(exc)}"
+        }), 500
+
+    qualities = build_format_list(info)
 
     result = {
+        "id": info.get("id"),
         "title": info.get("title"),
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
-        "uploader": info.get("uploader"),
-        "view_count": info.get("view_count"),
-        "formats": build_format_list(info),
+        "author": (
+            info.get("uploader")
+            or info.get("channel")
+            or "Unknown channel"
+        ),
+        "qualities": qualities
     }
+
     return jsonify(result)
 
 
-@app.route("/api/download", methods=["POST"])
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+@app.route("/api/download", methods=["GET", "POST"])
 def download_video():
-    """
-    Request JSON:  { "url": "<youtube url>", "format_id": "<id>" (optional),
-                     "audio_only": false (optional) }
-    Response:      the downloaded file as an attachment
-    """
-    data = request.get_json(silent=True) or {}
-    url = data.get("url", "").strip()
-    format_id = data.get("format_id")
-    audio_only = data.get("audio_only", False)
+
+    data = extract_request_data()
+
+    url = str(
+        data.get("url", "")
+    ).strip()
 
     if not url:
-        return jsonify({"error": "Missing 'url' in request body"}), 400
+        return jsonify({
+            "detail": "Missing 'url'."
+        }), 400
+
     if not is_valid_youtube_url(url):
-        return jsonify({"error": "Invalid YouTube URL"}), 400
+        return jsonify({
+            "detail": "Invalid YouTube URL."
+        }), 400
 
-    job_id = uuid.uuid4().hex[:10]
-    outtmpl = os.path.join(DOWNLOAD_DIR, f"{job_id}_%(title)s.%(ext)s")
-
-    if audio_only:
-        fmt_selector = "ba/b"
-        postprocessors = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ]
-    else:
-        fmt_selector = (
-            f"{format_id}+ba/b"
-            if format_id
-            else "bv*[height<=1080]+ba/b[height<=1080]/best"
-        )
-        postprocessors = []
-
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": fmt_selector,
-        "outtmpl": outtmpl,
-        "merge_output_format": "mp4" if not audio_only else None,
-        "postprocessors": postprocessors,
-        "noplaylist": True,
-        "extractor_args": {"youtube": ["player_client=web,mweb"]},
-    }
+    # Frontend sends:
+    #
+    # /api/download?url=...&height=720
+    #
+    height_value = data.get("height")
 
     try:
+        requested_height = int(height_value)
+    except (TypeError, ValueError):
+        return jsonify({
+            "detail": "Invalid video height."
+        }), 400
+
+    if requested_height not in ALLOWED_HEIGHTS:
+        return jsonify({
+            "detail": (
+                f"Unsupported quality. "
+                f"Choose one of: {ALLOWED_HEIGHTS}"
+            )
+        }), 400
+
+    job_id = uuid.uuid4().hex[:12]
+
+    outtmpl = os.path.join(
+        DOWNLOAD_DIR,
+        f"{job_id}_%(title)s.%(ext)s"
+    )
+
+    ydl_opts = base_ydl_opts()
+
+    ydl_opts.update({
+        "outtmpl": outtmpl,
+
+        # Prefer a video stream at or below requested height,
+        # then combine it with best available audio.
+        #
+        # If that exact target isn't available, yt-dlp will
+        # select the closest available stream below it.
+        "format": (
+            f"bestvideo[height<={requested_height}]"
+            f"+bestaudio/"
+            f"best[height<={requested_height}]"
+        ),
+
+        "merge_output_format": "mp4",
+
+        "postprocessors": [],
+
+        "noplaylist": True,
+
+        "retries": 3,
+
+        "fragment_retries": 3,
+
+        "continuedl": True,
+    })
+
+    try:
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
 
-        # Locate the output file created with the job_id prefix
-        matching_files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}_*"))
-        if not matching_files:
-            return jsonify({"error": "File was not created on server"}), 500
+            ydl.extract_info(
+                url,
+                download=True
+            )
 
+    except yt_dlp.utils.DownloadError as exc:
+
+        return jsonify({
+            "detail": f"Download failed: {str(exc)}"
+        }), 422
+
+    except Exception as exc:
+
+        return jsonify({
+            "detail": f"Unexpected download error: {str(exc)}"
+        }), 500
+
+    matching_files = glob.glob(
+        os.path.join(
+            DOWNLOAD_DIR,
+            f"{job_id}_*"
+        )
+    )
+
+    if not matching_files:
+
+        return jsonify({
+            "detail": "File was not created on the server."
+        }), 500
+
+    # Prefer the MP4 output.
+    mp4_files = [
+        path
+        for path in matching_files
+        if path.lower().endswith(".mp4")
+    ]
+
+    if mp4_files:
+        filepath = mp4_files[0]
+    else:
         filepath = matching_files[0]
 
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": f"Download failed: {str(e)}"}), 422
-
-    download_name = sanitize_filename(os.path.basename(filepath))
+    download_name = sanitize_filename(
+        os.path.basename(filepath)
+    )
 
     @after_this_request
     def cleanup(response):
+
         schedule_file_deletion(filepath)
+
         return response
 
     return send_file(
         filepath,
         as_attachment=True,
         download_name=download_name,
+        mimetype="video/mp4"
     )
 
 
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.route("/", methods=["GET"])
+def root():
+
+    return jsonify({
+        "service": "Fetch downloader API",
+        "status": "ok"
+    })
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+
+    port = int(
+        os.environ.get("PORT", 5000)
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=True
+    )
